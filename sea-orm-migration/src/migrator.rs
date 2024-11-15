@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::fmt::Display;
 use std::pin::Pin;
 use std::time::SystemTime;
-use tracing::info;
+use tracing::{debug, info};
 
 use sea_orm::sea_query::{
     self, extension::postgres::Type, Alias, Expr, ForeignKey, IntoIden, JoinType, Order, Query,
@@ -256,19 +256,8 @@ where
     ) -> Pin<Box<dyn Future<Output = Result<(), DbErr>> + Send + 'b>>,
 {
     let db = db.into_schema_manager_connection();
-
-    match db.get_database_backend() {
-        DbBackend::Postgres => {
-            let transaction = db.begin().await?;
-            let manager = SchemaManager::new(&transaction);
-            f(&manager).await?;
-            transaction.commit().await
-        }
-        DbBackend::MySql | DbBackend::Sqlite => {
-            let manager = SchemaManager::new(db);
-            f(&manager).await
-        }
-    }
+    let manager = SchemaManager::new(db);
+    f(&manager).await
 }
 
 async fn exec_fresh<M>(manager: &SchemaManager<'_>) -> Result<(), DbErr>
@@ -361,6 +350,7 @@ where
     M: MigratorTrait + ?Sized,
 {
     let db = manager.get_connection();
+    let backend = manager.get_database_backend();
 
     M::install(db).await?;
 
@@ -374,6 +364,7 @@ where
     if migrations.len() == 0 {
         info!("No pending migrations");
     }
+
     for Migration { migration, .. } in migrations {
         if let Some(steps) = steps.as_mut() {
             if steps == &0 {
@@ -381,9 +372,18 @@ where
             }
             *steps -= 1;
         }
+
         info!("Applying migration '{}'", migration.name());
-        migration.up(manager).await?;
+        if backend == DbBackend::Postgres {
+            debug!("Start postgres transaction");
+            let tx = db.begin().await?;
+            migration.up(&SchemaManager::new(&tx)).await?;
+            tx.commit().await?;
+        } else {
+            migration.up(manager).await?;
+        }
         info!("Migration '{}' has been applied", migration.name());
+
         let now = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("SystemTime before UNIX EPOCH!");
@@ -404,6 +404,7 @@ where
     M: MigratorTrait + ?Sized,
 {
     let db = manager.get_connection();
+    let backend = manager.get_database_backend();
 
     M::install(db).await?;
 
@@ -425,7 +426,14 @@ where
             *steps -= 1;
         }
         info!("Rolling back migration '{}'", migration.name());
-        migration.down(manager).await?;
+        if backend == DbBackend::Postgres {
+            debug!("Start postgres transaction");
+            let tx = db.begin().await?;
+            migration.down(&SchemaManager::new(&tx)).await?;
+            tx.commit().await?;
+        } else {
+            migration.down(manager).await?;
+        }
         info!("Migration '{}' has been rollbacked", migration.name());
         seaql_migrations::Entity::delete_many()
             .filter(Expr::col(seaql_migrations::Column::Version).eq(migration.name()))
